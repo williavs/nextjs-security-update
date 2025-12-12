@@ -163,56 +163,6 @@ select_accounts() {
     printf '%s\n' "${selected[@]}"
 }
 
-# Version mapping based on Next.js Security Advisory Dec 11, 2025
-get_target_version() {
-    local current="$1"
-    current="${current#^}"
-    current="${current#~}"
-
-    # Handle 'latest' or other non-semver
-    if [[ ! "$current" =~ ^[0-9]+\.[0-9]+ ]]; then
-        echo "14.2.35"
-        return
-    fi
-
-    local major minor
-    major=$(echo "$current" | cut -d. -f1)
-    minor=$(echo "$current" | cut -d. -f2)
-
-    # Handle canary versions
-    if [[ "$current" == *"canary"* ]]; then
-        case "$major" in
-            15) echo "15.6.0-canary.60" ;;
-            16) echo "16.1.0-canary.19" ;;
-            *)  echo "14.2.35" ;;
-        esac
-        return
-    fi
-
-    case "$major.$minor" in
-        13.*) echo "14.2.35" ;;
-        14.0|14.1|14.2) echo "14.2.35" ;;
-        15.0) echo "15.0.7" ;;
-        15.1) echo "15.1.11" ;;
-        15.2) echo "15.2.8" ;;
-        15.3) echo "15.3.8" ;;
-        15.4) echo "15.4.10" ;;
-        15.5) echo "15.5.9" ;;
-        16.0) echo "16.0.10" ;;
-        *)
-            if [[ "$major" -lt 13 ]]; then
-                echo "14.2.35"
-            elif [[ "$major" == "15" ]]; then
-                echo "15.5.9"
-            elif [[ "$major" == "16" ]]; then
-                echo "16.0.10"
-            else
-                echo "14.2.35"
-            fi
-            ;;
-    esac
-}
-
 process_repo() {
     local repo="$1"
     local repo_name
@@ -232,18 +182,14 @@ process_repo() {
     success "Found Next.js project: $repo"
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        local version
-        version=$(echo "$pkg_content" | jq -r '.dependencies.next // .devDependencies.next // empty')
-        local target
-        target=$(get_target_version "$version")
-        log "[DRY RUN] Would upgrade $repo: $version -> $target"
+        log "[DRY RUN] Would scan and fix $repo"
         return 0
     fi
 
-    # Clone if not already cloned
+    # Clone if not already cloned (full clone for lockfile commits)
     if [[ ! -d "$repo_name" ]]; then
         log "Cloning $repo..."
-        if ! gh repo clone "$repo" "$repo_name" -- --depth 1 2>/dev/null; then
+        if ! gh repo clone "$repo" "$repo_name" 2>/dev/null; then
             error "Failed to clone $repo"
             FAILED_REPOS+=("$repo - clone failed")
             return 1
@@ -252,67 +198,46 @@ process_repo() {
 
     cd "$repo_name"
 
-    local current_version
-    current_version=$(jq -r '.dependencies.next // .devDependencies.next // empty' package.json 2>/dev/null)
-
-    if [[ -z "$current_version" ]]; then
-        warn "Could not determine Next.js version for $repo"
-        cd "$WORK_DIR"
-        return 1
-    fi
-
-    log "Current version: $current_version"
-
-    local target_version
-    target_version=$(get_target_version "$current_version")
-    log "Target version: $target_version"
-
-    local current_clean="${current_version#^}"
-    current_clean="${current_clean#~}"
-    if [[ "$current_clean" == "$target_version" ]]; then
-        success "Already at patched version"
-        cd "$WORK_DIR"
-        return 0
-    fi
-
-    log "Upgrading Next.js..."
-    if jq -e '.dependencies.next' package.json >/dev/null 2>&1; then
-        jq ".dependencies.next = \"$target_version\"" package.json > package.json.tmp && mv package.json.tmp package.json
-    elif jq -e '.devDependencies.next' package.json >/dev/null 2>&1; then
-        jq ".devDependencies.next = \"$target_version\"" package.json > package.json.tmp && mv package.json.tmp package.json
-    fi
-
-    if git diff --quiet package.json 2>/dev/null; then
-        warn "No changes detected"
-        cd "$WORK_DIR"
-        return 0
-    fi
-
-    git add package.json
-    if ! git commit -m "security: upgrade Next.js to $target_version
-
-Addresses critical security vulnerabilities:
-- CVE-2025-55183 (Source Code Exposure)
-- CVE-2025-55184 (DoS)
-- CVE-2025-67779 (Complete DoS Fix)
-
-https://nextjs.org/blog/cve-2025-55183-and-cve-2025-55184" 2>/dev/null; then
-        error "Failed to commit changes for $repo"
-        FAILED_REPOS+=("$repo - commit failed")
-        cd "$WORK_DIR"
-        return 1
-    fi
-
-    UPGRADED_REPOS+=("$repo: $current_version -> $target_version")
-    success "Upgraded $repo: $current_version -> $target_version"
-
-    if [[ "$AUTO_PUSH" == "true" ]]; then
-        log "Pushing changes..."
-        if git push 2>/dev/null; then
-            success "Pushed $repo"
-        else
-            warn "Failed to push $repo (may need manual push)"
+    # Use official Vercel fix tool (handles monorepos, React RSC packages, lockfiles)
+    log "Running fix-react2shell-next..."
+    if npx --yes fix-react2shell-next@latest --fix 2>&1 | tee -a "$LOG_FILE"; then
+        # Check if any changes were made
+        if git diff --quiet HEAD 2>/dev/null; then
+            success "Already patched"
+            cd "$WORK_DIR"
+            return 0
         fi
+
+        # Commit changes (package.json + lockfiles, exclude node_modules)
+        git add -A
+        git reset HEAD -- node_modules 2>/dev/null || true
+
+        if ! git commit -m "security: patch Next.js vulnerabilities
+
+Applied via fix-react2shell-next (official Vercel tool)
+
+CVE-2025-66478 (RCE), CVE-2025-55183 (Source Code Exposure)
+CVE-2025-55184 (DoS), CVE-2025-67779 (Complete DoS Fix)
+
+https://github.com/vercel-labs/fix-react2shell-next" 2>/dev/null; then
+            success "No changes needed"
+            cd "$WORK_DIR"
+            return 0
+        fi
+
+        UPGRADED_REPOS+=("$repo")
+        success "Patched $repo"
+
+        if [[ "$AUTO_PUSH" == "true" ]]; then
+            log "Pushing..."
+            if git push 2>/dev/null; then
+                success "Pushed"
+            else
+                warn "Push failed (may need manual push)"
+            fi
+        fi
+    else
+        warn "Fix tool reported issues for $repo (may already be patched)"
     fi
 
     cd "$WORK_DIR"
